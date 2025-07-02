@@ -102,7 +102,7 @@ func (g *GruleEngine) notifyPreEvaluateRuleEntry(ctx context.Context, cycle uint
 }
 
 // notifyEvaluateRuleEntry will notify all registered listener that a rule is being evaluated.
-func (g *GruleEngine) notifyEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool, dataCtx ast.IDataContext) {
+func (g *GruleEngine) notifyEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool) {
 	if len(g.Listeners) > 0 {
 		for _, gl := range g.Listeners {
 			// Call the basic interface method for backward compatibility
@@ -112,11 +112,11 @@ func (g *GruleEngine) notifyEvaluateRuleEntry(ctx context.Context, cycle uint64,
 }
 
 // notifyPostEvaluateRuleEntry will notify all registered enhanced listeners after rule evaluation.
-func (g *GruleEngine) notifyPostEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool, dataCtx ast.IDataContext, execError error) {
+func (g *GruleEngine) notifyPostEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool, dataCtx ast.IDataContext, evalError error) {
 	if len(g.Listeners) > 0 {
 		for _, gl := range g.Listeners {
 			if egl, ok := gl.(EnhancedGruleEngineListener); ok {
-				egl.PostEvaluateRuleEntry(ctx, cycle, entry, candidate, dataCtx, execError)
+				egl.PostEvaluateRuleEntry(ctx, cycle, entry, candidate, dataCtx, evalError)
 			}
 		}
 	}
@@ -134,7 +134,7 @@ func (g *GruleEngine) notifyPreExecuteRuleEntry(ctx context.Context, cycle uint6
 }
 
 // notifyExecuteRuleEntry will notify all registered listener that a rule is being executed.
-func (g *GruleEngine) notifyExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, dataCtx ast.IDataContext) {
+func (g *GruleEngine) notifyExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry) {
 	if len(g.Listeners) > 0 {
 		for _, gl := range g.Listeners {
 			// Call the basic interface method for backward compatibility
@@ -233,7 +233,8 @@ func (g *GruleEngine) ExecuteWithContext(ctx context.Context, dataCtx ast.IDataC
 				can, err := ruleEntry.Evaluate(ctx, dataCtx, knowledge.WorkingMemory)
 
 				// notify all listeners that a rule's when scope has been evaluated
-				g.notifyEvaluateRuleEntry(ctx, cycle+1, ruleEntry, can, dataCtx)
+				g.notifyEvaluateRuleEntry(ctx, cycle+1, ruleEntry, can)
+				// notify enhanced listeners with evaluation result and any error
 				g.notifyPostEvaluateRuleEntry(ctx, cycle+1, ruleEntry, can, dataCtx, err)
 
 				if err != nil {
@@ -281,7 +282,7 @@ func (g *GruleEngine) ExecuteWithContext(ctx context.Context, dataCtx ast.IDataC
 			dataCtx.SetRuleEntry(runner)
 			// notify listeners that we are about to execute a rule entry then scope
 			g.notifyPreExecuteRuleEntry(ctx, cycle, runner, dataCtx)
-			g.notifyExecuteRuleEntry(ctx, cycle, runner, dataCtx)
+			g.notifyExecuteRuleEntry(ctx, cycle, runner)
 			// execute the top most prioritized rule
 			err := runner.Execute(ctx, dataCtx, knowledge.WorkingMemory)
 			// Add post-execution hook for enhanced listeners
