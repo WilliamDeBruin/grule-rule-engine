@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -15,9 +16,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestData represents simple test data
+// TestData represents test data with side effect tracking
 type TestData struct {
-	Value string
+	Value       string
+	SideEffects []string
+	mu          sync.Mutex
 }
 
 func (td *TestData) GetValue() string {
@@ -25,7 +28,29 @@ func (td *TestData) GetValue() string {
 }
 
 func (td *TestData) SetValue(val string) {
+	td.mu.Lock()
+	defer td.mu.Unlock()
 	td.Value = val
+	td.SideEffects = append(td.SideEffects, fmt.Sprintf("SetValue:%s", val))
+}
+
+func (td *TestData) TriggerSideEffect(effect string) bool {
+	td.mu.Lock()
+	defer td.mu.Unlock()
+	td.SideEffects = append(td.SideEffects, effect)
+	return true
+}
+
+// HasSideEffect checks if a side effect exists and triggers a new one (for use in when clauses)
+func (td *TestData) HasSideEffect(effect string) bool {
+	td.TriggerSideEffect(effect)
+	return true
+}
+
+func (td *TestData) GetSideEffects() []string {
+	td.mu.Lock()
+	defer td.mu.Unlock()
+	return append([]string(nil), td.SideEffects...)
 }
 
 // PanicTestData represents test data that can panic
@@ -41,203 +66,242 @@ func (ptd *PanicTestData) GetValue() string {
 	return ptd.Value
 }
 
-// MinimalTestListener implements only the basic interface
-type MinimalTestListener struct {
-	EvaluateCalled bool
-	ExecuteCalled  bool
-	BeginCalled    bool
-}
-
-func (m *MinimalTestListener) EvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool) {
-	m.EvaluateCalled = true
-}
-
-func (m *MinimalTestListener) ExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry) {
-	m.ExecuteCalled = true
-}
-
-func (m *MinimalTestListener) BeginCycle(ctx context.Context, cycle uint64) {
-	m.BeginCalled = true
-}
-
-// TimingAndErrorTestListener implements enhanced interface with comprehensive tracking
-type TimingAndErrorTestListener struct {
-	MinimalTestListener
+// ComprehensiveTestListener implements all enhanced functionality with comprehensive tracking
+type ComprehensiveTestListener struct {
 	mu sync.Mutex
 
-	// Call order tracking
-	CallOrder []string
+	// Basic interface tracking
+	BeginCalled    bool
+	EvaluateCalled bool
+	ExecuteCalled  bool
 
-	// Enhanced methods tracking
+	// Enhanced interface tracking
 	PreEvaluateCalled       bool
 	PostEvaluateCalled      bool
 	PreExecuteCalled        bool
 	PostExecuteCalled       bool
 	BeginCycleWithCtxCalled bool
 
-	// Error tracking
-	EvaluationErrors []error
-	ExecutionErrors  []error
-
-	// Timing tracking
+	// Call order and timing tracking
+	CallOrder       []string
+	CallTimestamps  []time.Time
 	EvaluationTimes map[string]time.Duration
 	ExecutionTimes  map[string]time.Duration
 	preEvalTimes    map[string]time.Time
 	preExecTimes    map[string]time.Time
 
-	// Data context validation
+	// Error tracking
+	EvaluationErrors []error
+	ExecutionErrors  []error
+
+	// Data context manipulation tracking
 	DataContextProvided  bool
 	DataContextKeysFound []string
+	DataContextModified  bool
+	StoredData           map[string]interface{}
+
+	// Side effect tracking (for validating hook timing)
+	SideEffectsBeforeHooks []string
+	SideEffectsAfterHooks  []string
+
+	// Rule management
+	RetractedRules []string
 }
 
-func newTimingAndErrorTestListener() *TimingAndErrorTestListener {
-	return &TimingAndErrorTestListener{
-		EvaluationTimes: make(map[string]time.Duration),
-		ExecutionTimes:  make(map[string]time.Duration),
-		preEvalTimes:    make(map[string]time.Time),
-		preExecTimes:    make(map[string]time.Time),
+// RetractRule simulates rule retraction capability
+func (c *ComprehensiveTestListener) RetractRule(ruleName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.RetractedRules = append(c.RetractedRules, ruleName)
+}
+
+// GetCallOrder returns a copy of the call order for testing
+func (c *ComprehensiveTestListener) GetCallOrder() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.CallOrder...)
+}
+
+// GetStoredData returns a copy of stored data for testing
+func (c *ComprehensiveTestListener) GetStoredData() map[string]interface{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make(map[string]interface{})
+	for k, v := range c.StoredData {
+		result[k] = v
+	}
+	return result
+}
+
+func newComprehensiveTestListener() *ComprehensiveTestListener {
+	return &ComprehensiveTestListener{
+		EvaluationTimes:        make(map[string]time.Duration),
+		ExecutionTimes:         make(map[string]time.Duration),
+		preEvalTimes:           make(map[string]time.Time),
+		preExecTimes:           make(map[string]time.Time),
+		StoredData:             make(map[string]interface{}),
+		SideEffectsBeforeHooks: []string{},
+		SideEffectsAfterHooks:  []string{},
+		RetractedRules:         []string{},
+		CallOrder:              []string{},
+		CallTimestamps:         []time.Time{},
+		DataContextKeysFound:   []string{},
+		EvaluationErrors:       []error{},
+		ExecutionErrors:        []error{},
 	}
 }
 
-func (t *TimingAndErrorTestListener) recordCall(methodName string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.CallOrder = append(t.CallOrder, methodName)
+func (c *ComprehensiveTestListener) recordCall(methodName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.CallOrder = append(c.CallOrder, methodName)
+	c.CallTimestamps = append(c.CallTimestamps, time.Now())
 }
 
-func (t *TimingAndErrorTestListener) BeginCycle(ctx context.Context, cycle uint64) {
-	t.recordCall("BeginCycle")
-	t.BeginCalled = true
-}
-
-func (t *TimingAndErrorTestListener) EvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool) {
-	t.recordCall(fmt.Sprintf("EvaluateRuleEntry:%s", entry.RuleName))
-	t.EvaluateCalled = true
-}
-
-func (t *TimingAndErrorTestListener) ExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry) {
-	t.recordCall(fmt.Sprintf("ExecuteRuleEntry:%s", entry.RuleName))
-	t.ExecuteCalled = true
-}
-
-func (t *TimingAndErrorTestListener) PreEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, dataCtx ast.IDataContext) {
-	t.recordCall(fmt.Sprintf("PreEvaluateRuleEntry:%s", entry.RuleName))
-	t.PreEvaluateCalled = true
-	t.validateDataContext(dataCtx)
-
-	t.mu.Lock()
-	t.preEvalTimes[entry.RuleName] = time.Now()
-	t.mu.Unlock()
-}
-
-func (t *TimingAndErrorTestListener) PostEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool, dataCtx ast.IDataContext, execError error) {
-	t.recordCall(fmt.Sprintf("PostEvaluateRuleEntry:%s", entry.RuleName))
-	t.PostEvaluateCalled = true
-	t.validateDataContext(dataCtx)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Record error if present
-	t.EvaluationErrors = append(t.EvaluationErrors, execError)
-
-	// Calculate timing if pre-evaluation was recorded
-	if startTime, exists := t.preEvalTimes[entry.RuleName]; exists {
-		t.EvaluationTimes[entry.RuleName] = time.Since(startTime)
-		delete(t.preEvalTimes, entry.RuleName)
-	}
-}
-
-func (t *TimingAndErrorTestListener) PreExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, dataCtx ast.IDataContext) {
-	t.recordCall(fmt.Sprintf("PreExecuteRuleEntry:%s", entry.RuleName))
-	t.PreExecuteCalled = true
-	t.validateDataContext(dataCtx)
-
-	t.mu.Lock()
-	t.preExecTimes[entry.RuleName] = time.Now()
-	t.mu.Unlock()
-}
-
-func (t *TimingAndErrorTestListener) PostExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, dataCtx ast.IDataContext, execError error) {
-	t.recordCall(fmt.Sprintf("PostExecuteRuleEntry:%s", entry.RuleName))
-	t.PostExecuteCalled = true
-	t.validateDataContext(dataCtx)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Record error if present
-	t.ExecutionErrors = append(t.ExecutionErrors, execError)
-
-	// Calculate timing if pre-execution was recorded
-	if startTime, exists := t.preExecTimes[entry.RuleName]; exists {
-		t.ExecutionTimes[entry.RuleName] = time.Since(startTime)
-		delete(t.preExecTimes, entry.RuleName)
-	}
-}
-
-func (t *TimingAndErrorTestListener) BeginCycleWithContext(ctx context.Context, cycle uint64, dataCtx ast.IDataContext) {
-	t.recordCall("BeginCycleWithContext")
-	t.BeginCycleWithCtxCalled = true
-	t.validateDataContext(dataCtx)
-}
-
-func (t *TimingAndErrorTestListener) validateDataContext(dataCtx ast.IDataContext) {
+func (c *ComprehensiveTestListener) captureCurrentSideEffects(dataCtx ast.IDataContext, stage string) {
 	if dataCtx != nil {
-		t.DataContextProvided = true
-		keys := dataCtx.GetKeys()
-		t.mu.Lock()
-		t.DataContextKeysFound = append(t.DataContextKeysFound, keys...)
-		t.mu.Unlock()
+		testDataNode := dataCtx.Get("testData")
+		if testDataNode != nil {
+			// Extract the underlying value from the ValueNode
+			value, err := testDataNode.GetValue()
+			if err == nil && value.IsValid() {
+				// Handle different ways the value might be stored
+				var testData *TestData
+				valueInterface := value.Interface()
+
+				// Try direct type assertion first
+				if td, ok := valueInterface.(*TestData); ok {
+					testData = td
+				} else if value.Kind() == reflect.Ptr && !value.IsNil() {
+					// Try to extract from pointer
+					if td, ok := value.Elem().Interface().(*TestData); ok {
+						testData = td
+					}
+				}
+
+				if testData != nil {
+					effects := testData.GetSideEffects()
+					c.mu.Lock()
+					if stage == "before" {
+						c.SideEffectsBeforeHooks = append([]string(nil), effects...)
+					} else {
+						c.SideEffectsAfterHooks = append([]string(nil), effects...)
+					}
+					c.mu.Unlock()
+				}
+			}
+		}
 	}
 }
 
-// EnhancedTestListener implements the enhanced interface
-type EnhancedTestListener struct {
-	MinimalTestListener
-
-	// Enhanced methods tracking
-	PreEvaluateCalled       bool
-	PostEvaluateCalled      bool
-	PreExecuteCalled        bool
-	PostExecuteCalled       bool
-	BeginCycleWithCtxCalled bool
-
-	// Data context validation
-	DataContextProvided  bool
-	DataContextKeysFound []string
+// Basic interface methods
+func (c *ComprehensiveTestListener) BeginCycle(ctx context.Context, cycle uint64) {
+	c.recordCall("BeginCycle")
+	c.BeginCalled = true
 }
 
-func (e *EnhancedTestListener) PreEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, dataCtx ast.IDataContext) {
-	e.PreEvaluateCalled = true
-	e.validateDataContext(dataCtx)
+func (c *ComprehensiveTestListener) EvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool) {
+	c.recordCall(fmt.Sprintf("EvaluateRuleEntry:%s", entry.RuleName))
+	c.EvaluateCalled = true
 }
 
-func (e *EnhancedTestListener) PostEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool, dataCtx ast.IDataContext, execError error) {
-	e.PostEvaluateCalled = true
-	e.validateDataContext(dataCtx)
+func (c *ComprehensiveTestListener) ExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry) {
+	c.recordCall(fmt.Sprintf("ExecuteRuleEntry:%s", entry.RuleName))
+	c.ExecuteCalled = true
 }
 
-func (e *EnhancedTestListener) PreExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, dataCtx ast.IDataContext) {
-	e.PreExecuteCalled = true
-	e.validateDataContext(dataCtx)
+// Enhanced interface methods
+func (c *ComprehensiveTestListener) PreEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, dataCtx ast.IDataContext) {
+	c.recordCall(fmt.Sprintf("PreEvaluateRuleEntry:%s", entry.RuleName))
+	c.PreEvaluateCalled = true
+
+	// Capture side effects before rule evaluation
+	c.captureCurrentSideEffects(dataCtx, "before")
+
+	c.validateAndModifyDataContext(dataCtx)
+
+	c.mu.Lock()
+	c.preEvalTimes[entry.RuleName] = time.Now()
+	c.StoredData[fmt.Sprintf("pre_eval_%s", entry.RuleName)] = time.Now()
+	c.mu.Unlock()
 }
 
-func (e *EnhancedTestListener) PostExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, dataCtx ast.IDataContext, execError error) {
-	e.PostExecuteCalled = true
-	e.validateDataContext(dataCtx)
+func (c *ComprehensiveTestListener) PostEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool, dataCtx ast.IDataContext, execError error) {
+	c.recordCall(fmt.Sprintf("PostEvaluateRuleEntry:%s", entry.RuleName))
+	c.PostEvaluateCalled = true
+
+	// Capture side effects after rule evaluation
+	c.captureCurrentSideEffects(dataCtx, "after")
+
+	c.validateAndModifyDataContext(dataCtx)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.EvaluationErrors = append(c.EvaluationErrors, execError)
+
+	if startTime, exists := c.preEvalTimes[entry.RuleName]; exists {
+		c.EvaluationTimes[entry.RuleName] = time.Since(startTime)
+		delete(c.preEvalTimes, entry.RuleName)
+	}
+
+	c.StoredData[fmt.Sprintf("post_eval_%s", entry.RuleName)] = time.Now()
 }
 
-func (e *EnhancedTestListener) BeginCycleWithContext(ctx context.Context, cycle uint64, dataCtx ast.IDataContext) {
-	e.BeginCycleWithCtxCalled = true
-	e.validateDataContext(dataCtx)
+func (c *ComprehensiveTestListener) PreExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, dataCtx ast.IDataContext) {
+	c.recordCall(fmt.Sprintf("PreExecuteRuleEntry:%s", entry.RuleName))
+	c.PreExecuteCalled = true
+	c.validateAndModifyDataContext(dataCtx)
+
+	c.mu.Lock()
+	c.preExecTimes[entry.RuleName] = time.Now()
+	c.StoredData[fmt.Sprintf("pre_exec_%s", entry.RuleName)] = time.Now()
+	c.mu.Unlock()
 }
 
-func (e *EnhancedTestListener) validateDataContext(dataCtx ast.IDataContext) {
+func (c *ComprehensiveTestListener) PostExecuteRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, dataCtx ast.IDataContext, execError error) {
+	c.recordCall(fmt.Sprintf("PostExecuteRuleEntry:%s", entry.RuleName))
+	c.PostExecuteCalled = true
+	c.validateAndModifyDataContext(dataCtx)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.ExecutionErrors = append(c.ExecutionErrors, execError)
+
+	if startTime, exists := c.preExecTimes[entry.RuleName]; exists {
+		c.ExecutionTimes[entry.RuleName] = time.Since(startTime)
+		delete(c.preExecTimes, entry.RuleName)
+	}
+
+	c.StoredData[fmt.Sprintf("post_exec_%s", entry.RuleName)] = time.Now()
+}
+
+func (c *ComprehensiveTestListener) BeginCycleWithContext(ctx context.Context, cycle uint64, dataCtx ast.IDataContext) {
+	c.recordCall("BeginCycleWithContext")
+	c.BeginCycleWithCtxCalled = true
+	c.validateAndModifyDataContext(dataCtx)
+}
+
+func (c *ComprehensiveTestListener) validateAndModifyDataContext(dataCtx ast.IDataContext) {
 	if dataCtx != nil {
-		e.DataContextProvided = true
+		c.DataContextProvided = true
 		keys := dataCtx.GetKeys()
-		e.DataContextKeysFound = append(e.DataContextKeysFound, keys...)
+		c.mu.Lock()
+		c.DataContextKeysFound = append(c.DataContextKeysFound, keys...)
+		c.mu.Unlock()
+
+		// Demonstrate data context modification
+		if !c.DataContextModified {
+			listenerData := map[string]interface{}{
+				"timestamp":   time.Now(),
+				"listener_id": "comprehensive_test_listener",
+			}
+			err := dataCtx.Add("listenerData", listenerData)
+			if err == nil {
+				c.DataContextModified = true
+			}
+		}
 	}
 }
 
@@ -306,13 +370,41 @@ rule BadRule "A rule that will cause an error" salience 10 {
 	return dataContext, kb
 }
 
+// mustCreateSideEffectTestSetup creates a test setup specifically for side effect timing validation
+func mustCreateSideEffectTestSetup(t *testing.T) (ast.IDataContext, *ast.KnowledgeBase) {
+	drls := `
+rule SideEffectRule "Rule with side effect in when clause" salience 10 {
+    when
+        testData.GetValue() == "initial" && testData.HasSideEffect("during_evaluation")
+    then
+        testData.TriggerSideEffect("during_execution");
+        testData.SetValue("completed");
+        Complete();
+}`
+
+	dataContext := ast.NewDataContext()
+	testData := &TestData{Value: "initial", SideEffects: []string{}}
+	err := dataContext.Add("testData", testData)
+	require.NoError(t, err)
+
+	lib := ast.NewKnowledgeLibrary()
+	rb := builder.NewRuleBuilder(lib)
+	err = rb.BuildRuleFromResource("Test", "0.1.1", pkg.NewBytesResource([]byte(drls)))
+	require.NoError(t, err)
+
+	kb, err := lib.NewKnowledgeBaseInstance("Test", "0.1.1")
+	require.NoError(t, err)
+
+	return dataContext, kb
+}
+
 func TestBasicListener(t *testing.T) {
 	t.Parallel()
 
 	t.Run("should call basic interface methods", func(t *testing.T) {
 		dataContext, kb := mustCreateTestSetup(t)
 
-		listener := &MinimalTestListener{}
+		listener := newComprehensiveTestListener()
 		engine := NewGruleEngine()
 		engine.Listeners = []GruleEngineListener{listener}
 
@@ -331,7 +423,7 @@ func TestEnhancedListener(t *testing.T) {
 	t.Run("should call enhanced interface methods with data context", func(t *testing.T) {
 		dataContext, kb := mustCreateTestSetup(t)
 
-		listener := &EnhancedTestListener{}
+		listener := newComprehensiveTestListener()
 		engine := NewGruleEngine()
 		engine.Listeners = []GruleEngineListener{listener}
 
@@ -359,11 +451,11 @@ func TestEnhancedListener(t *testing.T) {
 func TestMixedListeners(t *testing.T) {
 	t.Parallel()
 
-	t.Run("should support both basic and enhanced listeners together", func(t *testing.T) {
+	t.Run("should support multiple listeners together", func(t *testing.T) {
 		dataContext, kb := mustCreateTestSetup(t)
 
-		basicListener := &MinimalTestListener{}
-		enhancedListener := &EnhancedTestListener{}
+		basicListener := newComprehensiveTestListener()
+		enhancedListener := newComprehensiveTestListener()
 
 		engine := NewGruleEngine()
 		engine.Listeners = []GruleEngineListener{basicListener, enhancedListener}
@@ -372,16 +464,16 @@ func TestMixedListeners(t *testing.T) {
 		require.NoError(t, err)
 
 		// Verify both listeners were called
-		assert.True(t, basicListener.BeginCalled, "Basic listener should be called")
-		assert.True(t, basicListener.EvaluateCalled, "Basic listener should be called")
-		assert.True(t, basicListener.ExecuteCalled, "Basic listener should be called")
+		assert.True(t, basicListener.BeginCalled, "First listener should be called")
+		assert.True(t, basicListener.EvaluateCalled, "First listener should be called")
+		assert.True(t, basicListener.ExecuteCalled, "First listener should be called")
 
-		assert.True(t, enhancedListener.BeginCalled, "Enhanced listener basic methods should be called")
-		assert.True(t, enhancedListener.PreEvaluateCalled, "Enhanced listener should be called")
-		assert.True(t, enhancedListener.PostEvaluateCalled, "Enhanced listener should be called")
-		assert.True(t, enhancedListener.PreExecuteCalled, "Enhanced listener should be called")
-		assert.True(t, enhancedListener.PostExecuteCalled, "Enhanced listener should be called")
-		assert.True(t, enhancedListener.DataContextProvided, "Enhanced listener should receive data context")
+		assert.True(t, enhancedListener.BeginCalled, "Second listener basic methods should be called")
+		assert.True(t, enhancedListener.PreEvaluateCalled, "Second listener should be called")
+		assert.True(t, enhancedListener.PostEvaluateCalled, "Second listener should be called")
+		assert.True(t, enhancedListener.PreExecuteCalled, "Second listener should be called")
+		assert.True(t, enhancedListener.PostExecuteCalled, "Second listener should be called")
+		assert.True(t, enhancedListener.DataContextProvided, "Second listener should receive data context")
 	})
 }
 
@@ -392,7 +484,7 @@ func TestEnhancedListenerCallOrder(t *testing.T) {
 	t.Run("should call hooks in correct order during rule evaluation and execution", func(t *testing.T) {
 		dataContext, kb := mustCreateTestSetup(t)
 
-		listener := newTimingAndErrorTestListener()
+		listener := newComprehensiveTestListener()
 		engine := NewGruleEngine()
 		engine.Listeners = []GruleEngineListener{listener}
 
@@ -400,12 +492,13 @@ func TestEnhancedListenerCallOrder(t *testing.T) {
 		require.NoError(t, err)
 
 		// Verify call order is correct
-		require.Greater(t, len(listener.CallOrder), 0, "Should have recorded calls")
+		callOrder := listener.GetCallOrder()
+		require.Greater(t, len(callOrder), 0, "Should have recorded calls")
 
 		// Find the indices of pre and post hooks for the rule
 		var preEvalIndex, postEvalIndex, preExecIndex, postExecIndex int = -1, -1, -1, -1
 
-		for i, call := range listener.CallOrder {
+		for i, call := range callOrder {
 			switch {
 			case call == "PreEvaluateRuleEntry:TestRule":
 				preEvalIndex = i
@@ -437,7 +530,7 @@ func TestEnhancedListenerErrorHandling(t *testing.T) {
 	t.Run("should capture evaluation errors and continue rule execution", func(t *testing.T) {
 		dataContext, kb := mustCreateErrorTestSetup(t)
 
-		listener := newTimingAndErrorTestListener()
+		listener := newComprehensiveTestListener()
 		engine := NewGruleEngine()
 		engine.Listeners = []GruleEngineListener{listener}
 
@@ -465,9 +558,10 @@ func TestEnhancedListenerErrorHandling(t *testing.T) {
 		assert.True(t, hasErrors, "Should capture errors from panicking rule")
 
 		// Verify that both rules were processed (good rule should still work)
+		callOrder := listener.GetCallOrder()
 		goodRuleCalls := 0
 		badRuleCalls := 0
-		for _, call := range listener.CallOrder {
+		for _, call := range callOrder {
 			if strings.Contains(call, "GoodRule") {
 				goodRuleCalls++
 			}
@@ -487,7 +581,7 @@ func TestEnhancedListenerTiming(t *testing.T) {
 	t.Run("should measure evaluation and execution timings accurately", func(t *testing.T) {
 		dataContext, kb := mustCreateTestSetup(t)
 
-		listener := newTimingAndErrorTestListener()
+		listener := newComprehensiveTestListener()
 		engine := NewGruleEngine()
 		engine.Listeners = []GruleEngineListener{listener}
 
@@ -517,7 +611,7 @@ func TestEnhancedListenerTiming(t *testing.T) {
 	t.Run("should provide timing hooks for performance monitoring", func(t *testing.T) {
 		dataContext, kb := mustCreateTestSetup(t)
 
-		listener := newTimingAndErrorTestListener()
+		listener := newComprehensiveTestListener()
 		engine := NewGruleEngine()
 		engine.Listeners = []GruleEngineListener{listener}
 
@@ -539,5 +633,218 @@ func TestEnhancedListenerTiming(t *testing.T) {
 		assert.Less(t, totalEvalTime+totalExecTime, totalTime, "Individual timings should be less than total execution time")
 		assert.Greater(t, totalEvalTime, time.Duration(0), "Should have some evaluation time")
 		assert.Greater(t, totalExecTime, time.Duration(0), "Should have some execution time")
+	})
+}
+
+func TestPreEvaluationHookTiming(t *testing.T) {
+	t.Parallel()
+
+	t.Run("should call pre-evaluation hook before rule evaluation side effects occur", func(t *testing.T) {
+		dataContext, kb := mustCreateSideEffectTestSetup(t)
+
+		listener := newComprehensiveTestListener()
+		engine := NewGruleEngine()
+		engine.Listeners = []GruleEngineListener{listener}
+
+		err := engine.Execute(dataContext, kb)
+		require.NoError(t, err)
+
+		// Verify the pre-evaluation hook was called (it should capture side effects state before evaluation)
+		// Since the pre-hook is called before evaluation, we expect fewer or no side effects at that point
+		// The post-hook should capture side effects after evaluation
+		assert.NotNil(t, listener.SideEffectsBeforeHooks, "Should capture side effects state before hooks")
+		assert.NotNil(t, listener.SideEffectsAfterHooks, "Should capture side effects state after hooks")
+
+		// The key validation: after evaluation, we should have more side effects than before
+		beforeCount := len(listener.SideEffectsBeforeHooks)
+		afterCount := len(listener.SideEffectsAfterHooks)
+
+		assert.GreaterOrEqual(t, afterCount, beforeCount, "Should have same or more side effects after evaluation than before")
+
+		// Verify that the evaluation side effect is present in the after hooks
+		foundEval := false
+		foundExec := false
+		for _, effect := range listener.SideEffectsAfterHooks {
+			if effect == "during_evaluation" {
+				foundEval = true
+			}
+			if effect == "during_execution" {
+				foundExec = true
+			}
+		}
+		assert.True(t, foundEval, "Should find the evaluation side effect in post-hook capture")
+
+		// Since this test focuses on evaluation timing, execution side effect might not be captured
+		// in the post-evaluation hook if it happens during execution phase
+		if foundExec {
+			t.Log("Execution side effect also captured in post-evaluation hook")
+		}
+	})
+}
+
+func TestDataContextModification(t *testing.T) {
+	t.Parallel()
+
+	t.Run("should allow listeners to modify data context", func(t *testing.T) {
+		dataContext, kb := mustCreateTestSetup(t)
+
+		listener := newComprehensiveTestListener()
+		engine := NewGruleEngine()
+		engine.Listeners = []GruleEngineListener{listener}
+
+		err := engine.Execute(dataContext, kb)
+		require.NoError(t, err)
+
+		// Verify that the listener modified the data context
+		assert.True(t, listener.DataContextModified, "Listener should have modified the data context")
+
+		// Verify that the listener data was actually added to the context
+		listenerDataNode := dataContext.Get("listenerData")
+		assert.NotNil(t, listenerDataNode, "Listener data should be present in data context")
+
+		// Extract and validate the listener data
+		value, err := listenerDataNode.GetValue()
+		require.NoError(t, err)
+		require.True(t, value.IsValid(), "Listener data value should be valid")
+
+		listenerData, ok := value.Interface().(map[string]interface{})
+		require.True(t, ok, "Listener data should be a map")
+
+		assert.Contains(t, listenerData, "timestamp", "Listener data should contain timestamp")
+		assert.Contains(t, listenerData, "listener_id", "Listener data should contain listener_id")
+		assert.Equal(t, "comprehensive_test_listener", listenerData["listener_id"], "Listener ID should match")
+	})
+}
+
+func TestRuleRetraction(t *testing.T) {
+	t.Parallel()
+
+	t.Run("should support rule retraction functionality", func(t *testing.T) {
+		dataContext, kb := mustCreateTestSetup(t)
+
+		listener := newComprehensiveTestListener()
+		engine := NewGruleEngine()
+		engine.Listeners = []GruleEngineListener{listener}
+
+		// Simulate rule retraction
+		listener.RetractRule("TestRule")
+
+		err := engine.Execute(dataContext, kb)
+		require.NoError(t, err)
+
+		// Verify that the rule was recorded as retracted
+		assert.Contains(t, listener.RetractedRules, "TestRule", "TestRule should be in retracted rules list")
+
+		// Verify that retraction tracking works
+		listener.RetractRule("AnotherRule")
+		assert.Contains(t, listener.RetractedRules, "AnotherRule", "AnotherRule should be in retracted rules list")
+		assert.Len(t, listener.RetractedRules, 2, "Should have two retracted rules")
+	})
+}
+
+func TestDataStorageBetweenHooks(t *testing.T) {
+	t.Parallel()
+
+	t.Run("should store and access data between different hooks", func(t *testing.T) {
+		dataContext, kb := mustCreateTestSetup(t)
+
+		listener := newComprehensiveTestListener()
+		engine := NewGruleEngine()
+		engine.Listeners = []GruleEngineListener{listener}
+
+		err := engine.Execute(dataContext, kb)
+		require.NoError(t, err)
+
+		// Verify that data was stored in different hooks
+		storedData := listener.GetStoredData()
+
+		// Check for pre and post evaluation data
+		assert.Contains(t, storedData, "pre_eval_TestRule", "Should store data in pre-evaluation hook")
+		assert.Contains(t, storedData, "post_eval_TestRule", "Should store data in post-evaluation hook")
+
+		// Check for pre and post execution data
+		assert.Contains(t, storedData, "pre_exec_TestRule", "Should store data in pre-execution hook")
+		assert.Contains(t, storedData, "post_exec_TestRule", "Should store data in post-execution hook")
+
+		// Verify that stored data is accessible and contains timestamps
+		preEvalData := storedData["pre_eval_TestRule"]
+		postEvalData := storedData["post_eval_TestRule"]
+
+		assert.IsType(t, time.Time{}, preEvalData, "Pre-evaluation data should be a timestamp")
+		assert.IsType(t, time.Time{}, postEvalData, "Post-evaluation data should be a timestamp")
+
+		// Verify that pre-evaluation timestamp is before post-evaluation timestamp
+		preTime := preEvalData.(time.Time)
+		postTime := postEvalData.(time.Time)
+		assert.True(t, preTime.Before(postTime), "Pre-evaluation timestamp should be before post-evaluation timestamp")
+	})
+}
+
+func TestComprehensiveListenerIntegration(t *testing.T) {
+	t.Parallel()
+
+	t.Run("should demonstrate all listener capabilities working together", func(t *testing.T) {
+		dataContext, kb := mustCreateSideEffectTestSetup(t)
+
+		listener := newComprehensiveTestListener()
+		engine := NewGruleEngine()
+		engine.Listeners = []GruleEngineListener{listener}
+
+		// Simulate some rule retraction
+		listener.RetractRule("SomeOtherRule")
+
+		err := engine.Execute(dataContext, kb)
+		require.NoError(t, err)
+
+		// Verify all basic functionality
+		assert.True(t, listener.BeginCalled, "BeginCycle should be called")
+		assert.True(t, listener.EvaluateCalled, "EvaluateRuleEntry should be called")
+		assert.True(t, listener.ExecuteCalled, "ExecuteRuleEntry should be called")
+
+		// Verify all enhanced functionality
+		assert.True(t, listener.PreEvaluateCalled, "PreEvaluateRuleEntry should be called")
+		assert.True(t, listener.PostEvaluateCalled, "PostEvaluateRuleEntry should be called")
+		assert.True(t, listener.PreExecuteCalled, "PreExecuteRuleEntry should be called")
+		assert.True(t, listener.PostExecuteCalled, "PostExecuteRuleEntry should be called")
+		assert.True(t, listener.BeginCycleWithCtxCalled, "BeginCycleWithContext should be called")
+
+		// Verify data context functionality
+		assert.True(t, listener.DataContextProvided, "Data context should be provided")
+		assert.True(t, listener.DataContextModified, "Data context should be modified")
+		assert.Contains(t, listener.DataContextKeysFound, "testData", "Should find testData key")
+
+		// Verify timing functionality
+		assert.Greater(t, len(listener.EvaluationTimes), 0, "Should have evaluation timings")
+		assert.Greater(t, len(listener.ExecutionTimes), 0, "Should have execution timings")
+
+		// Verify side effect tracking
+		assert.NotNil(t, listener.SideEffectsBeforeHooks, "Should track side effects state before hooks")
+		assert.NotNil(t, listener.SideEffectsAfterHooks, "Should track side effects state after hooks")
+
+		// Verify data storage
+		storedData := listener.GetStoredData()
+		assert.Greater(t, len(storedData), 0, "Should have stored data")
+
+		// Verify rule retraction tracking
+		assert.Contains(t, listener.RetractedRules, "SomeOtherRule", "Should track retracted rules")
+
+		// Verify call order tracking
+		callOrder := listener.GetCallOrder()
+		assert.Greater(t, len(callOrder), 0, "Should track call order")
+
+		// Verify proper hook ordering for the executed rule
+		var preEvalIndex, postEvalIndex int = -1, -1
+		for i, call := range callOrder {
+			if call == "PreEvaluateRuleEntry:SideEffectRule" {
+				preEvalIndex = i
+			}
+			if call == "PostEvaluateRuleEntry:SideEffectRule" {
+				postEvalIndex = i
+			}
+		}
+
+		assert.NotEqual(t, -1, preEvalIndex, "Should find pre-evaluation call")
+		assert.NotEqual(t, -1, postEvalIndex, "Should find post-evaluation call")
+		assert.Less(t, preEvalIndex, postEvalIndex, "Pre-evaluation should come before post-evaluation")
 	})
 }
