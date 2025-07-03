@@ -229,6 +229,11 @@ func (g *GruleEngine) ExecuteWithContext(ctx context.Context, dataCtx ast.IDataC
 				// notify all enhanced listeners that we are about to evaluate a rule's when scope
 				g.notifyPreEvaluateRuleEntry(ctx, cycle+1, ruleEntry, dataCtx)
 
+				// check again if the rule was retracted or deleted during the PreEvaluateRuleEntry callback
+				if ruleEntry.Retracted || ruleEntry.Deleted {
+					continue
+				}
+
 				// test if this rule entry v can execute.
 				can, err := ruleEntry.Evaluate(ctx, dataCtx, knowledge.WorkingMemory)
 
@@ -282,6 +287,12 @@ func (g *GruleEngine) ExecuteWithContext(ctx context.Context, dataCtx ast.IDataC
 			dataCtx.SetRuleEntry(runner)
 			// notify listeners that we are about to execute a rule entry then scope
 			g.notifyPreExecuteRuleEntry(ctx, cycle, runner, dataCtx)
+			
+			// check if the rule was retracted or deleted during the PreExecuteRuleEntry callback
+			if runner.Retracted || runner.Deleted {
+				continue
+			}
+			
 			g.notifyExecuteRuleEntry(ctx, cycle, runner)
 			// execute the top most prioritized rule
 			err := runner.Execute(ctx, dataCtx, knowledge.WorkingMemory)

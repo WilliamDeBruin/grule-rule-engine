@@ -23,6 +23,15 @@ rule TestRule "triggers side effect in when clause and sleeps in then clause" sa
 		fact.Value = "changed";
 }
 `
+	// Rules for testing retraction and deletion
+	retractRule = `
+rule RetractRule "rule to be retracted" salience 20 {
+	when 
+		fact.Value == "initial"
+	then 
+		fact.Value = "should never be executed";
+}
+`
 )
 
 // TestFact represents a test fact for listener testing
@@ -60,6 +69,10 @@ type TestEnhancedListener struct {
 	// Configuration
 	shouldRetractRule bool
 	retractedRules    []string
+
+	// Configuration for rule manipulation
+	preEvaluationRulesToRetract []string
+	preExecutionRulesToRetract  []string
 }
 
 // ListenerCall represents a method call on the listener
@@ -79,14 +92,15 @@ type CycleCall struct {
 
 func NewTestEnhancedListener() *TestEnhancedListener {
 	return &TestEnhancedListener{
-		PreEvaluateCalls:  make([]ListenerCall, 0),
-		PostEvaluateCalls: make([]ListenerCall, 0),
-		PreExecuteCalls:   make([]ListenerCall, 0),
-		PostExecuteCalls:  make([]ListenerCall, 0),
-		BeginCycleCalls:   make([]CycleCall, 0),
-		executionTimers:   make(map[string]time.Time),
-		executionTimes:    make(map[string]time.Duration),
-		retractedRules:    make([]string, 0),
+		PreEvaluateCalls:            make([]ListenerCall, 0),
+		PostEvaluateCalls:           make([]ListenerCall, 0),
+		PreExecuteCalls:             make([]ListenerCall, 0),
+		PostExecuteCalls:            make([]ListenerCall, 0),
+		BeginCycleCalls:             make([]CycleCall, 0),
+		executionTimers:             make(map[string]time.Time),
+		executionTimes:              make(map[string]time.Duration),
+		retractedRules:              make([]string, 0),
+		preEvaluationRulesToRetract: make([]string, 0),
 	}
 }
 
@@ -111,6 +125,13 @@ func (tel *TestEnhancedListener) PreEvaluateRuleEntry(ctx context.Context, cycle
 		RuleName: entry.RuleName,
 		Fact:     fact,
 	})
+
+	// Check if this rule should be retracted
+	for _, ruleName := range tel.preEvaluationRulesToRetract {
+		if entry.RuleName == ruleName {
+			entry.Retracted = true
+		}
+	}
 }
 
 func (tel *TestEnhancedListener) PostEvaluateRuleEntry(ctx context.Context, cycle uint64, entry *ast.RuleEntry, candidate bool, dataCtx ast.IDataContext, execError error) {
@@ -138,8 +159,15 @@ func (tel *TestEnhancedListener) PreExecuteRuleEntry(ctx context.Context, cycle 
 
 	// Optionally retract rule if configured
 	if tel.shouldRetractRule {
-		dataCtx.Retract("TestRule")
+		entry.Retracted = true
 		tel.retractedRules = append(tel.retractedRules, ruleName)
+	}
+
+	for _, ruleName := range tel.preExecutionRulesToRetract {
+		if entry.RuleName == ruleName {
+			entry.Retracted = true
+			tel.retractedRules = append(tel.retractedRules, ruleName)
+		}
 	}
 }
 
@@ -307,9 +335,73 @@ func TestEnhancedGruleEngineListener(t *testing.T) {
 		assert.NotEmpty(t, listener.retractedRules, "At least one rule should have been retracted")
 		assert.Contains(t, listener.retractedRules, "TestRule", "TestRule should have been retracted")
 
-		// And: the data context should show the rule as retracted
-		retractedRules := dctx.Retracted()
-		assert.Contains(t, retractedRules, "TestRule", "TestRule should be in retracted rules list")
+		// And: the fact value should remain unchanged since rule was retracted before execution
+		assert.Equal(t, "initial", fact.Value, "Fact value should remain unchanged as rule was retracted")
+	})
+
+	t.Run("should retract rules before evaluation", func(t *testing.T) {
+		// Given: a test fact and enhanced listener
+		fact := &TestFact{Value: "initial"}
+		listener := NewTestEnhancedListener()
+		listener.preEvaluationRulesToRetract = []string{"RetractRule"}
+
+		// And: a data context with the fact
+		dctx := ast.NewDataContext()
+		err := dctx.Add("fact", fact)
+		require.NoError(t, err)
+
+		// And: a knowledge base with multiple rules
+		kb := mustCreateKnowledgeBase(t, retractRule)
+
+		// And: an engine with the enhanced listener
+		engine := NewGruleEngine()
+		engine.Listeners = append(engine.Listeners, listener)
+
+		// When: executing the rules
+		err = engine.Execute(dctx, kb)
+		require.NoError(t, err)
+
+		// Then: validate that the rule was called in PreEvaluate but not evaluated
+		assert.Len(t, listener.PreEvaluateCalls, 1, "PreEvaluateRuleEntry should have been called")
+		assert.Equal(t, "RetractRule", listener.PreEvaluateCalls[0].RuleName, "PreEvaluateRuleEntry should have been called for RetractRule")
+
+		// And: the rule should not have been evaluated (no PostEvaluate calls)
+		assert.Empty(t, listener.PostEvaluateCalls, "rule should not have been evaluated after retraction")
+
+		// And: the fact value should remain unchanged
+		assert.Equal(t, "initial", fact.Value, "Fact value should remain unchanged as rule was retracted")
+	})
+
+	t.Run("should retract rules before execution", func(t *testing.T) {
+		// Given: a test fact and enhanced listener
+		fact := &TestFact{Value: "initial"}
+		listener := NewTestEnhancedListener()
+		listener.preExecutionRulesToRetract = []string{"RetractRule"}
+
+		// And: a data context with the fact
+		dctx := ast.NewDataContext()
+		err := dctx.Add("fact", fact)
+		require.NoError(t, err)
+
+		// And: a knowledge base with multiple rules
+		kb := mustCreateKnowledgeBase(t, retractRule)
+
+		// And: an engine with the enhanced listener
+		engine := NewGruleEngine()
+		engine.Listeners = append(engine.Listeners, listener)
+
+		// When: executing the rules
+		err = engine.Execute(dctx, kb)
+		require.NoError(t, err)
+
+		// Then: validate that the rule was evaluated but not executed
+		assert.Len(t, listener.PreEvaluateCalls, 1, "PreEvaluateRuleEntry should have been called")
+		assert.Len(t, listener.PostEvaluateCalls, 1, "PostEvaluateRuleEntry should have been called")
+		assert.Len(t, listener.PreExecuteCalls, 1, "PreExecuteRuleEntry should have been called")
+		assert.Empty(t, listener.PostExecuteCalls, "rule should not have been executed after retraction")
+
+		// And: the fact value should remain unchanged
+		assert.Equal(t, "initial", fact.Value, "Fact value should remain unchanged as rule was retracted")
 	})
 }
 
